@@ -9,8 +9,12 @@ enigo = "0.6.1"
 getrandom = "0.4"
 hmac = "0.13.0"
 image = "0.25.10"
+raw-window-handle = "0.6"
 sha2 = "0.11.0"
-xcap = "0.9.8"
+tray-icon = "0.26.1"
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+# wgc = Windows Graphics Capture: captures fullscreen/DirectX games that GDI renders black.
+xcap = { version = "0.9.8", features = ["wgc"] }
 
 [profile.release]
 strip = true
