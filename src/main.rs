@@ -62,8 +62,13 @@ struct Shared {
 }
 type Sh = Arc<Mutex<Shared>>;
 
+/// Lock that survives a poisoned mutex: a panic in one thread shouldn't crash the rest.
+fn lock(sh: &Sh) -> std::sync::MutexGuard<'_, Shared> {
+    sh.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn set_status(sh: &Sh, msg: impl Into<String>) {
-    sh.lock().unwrap().status = msg.into();
+    lock(sh).status = msg.into();
 }
 
 // ---------- Tailscale setup ----------
@@ -121,16 +126,19 @@ fn host(sh: Sh, ip: String, password: String) {
     let listener = match TcpListener::bind((ip.as_str(), PORT)) {
         Ok(l) => l,
         Err(e) => {
-            sh.lock().unwrap().hosting = false;
+            lock(&sh).hosting = false;
             return set_status(&sh, format!("Couldn't start sharing: {e}"));
         }
     };
     for conn in listener.incoming() {
         set_status(&sh, format!("Sharing at {ip}. Waiting for your friend..."));
         let Ok(mut conn) = conn else { continue };
-        let err = serve(&sh, &mut conn, &password).unwrap_err();
+        let note = match serve(&sh, &mut conn, &password) {
+            Err(e) => format!(" ({e})"),
+            Ok(()) => String::new(),
+        };
         let _ = conn.shutdown(Shutdown::Both);
-        set_status(&sh, format!("Sharing at {ip}. Last viewer left ({err}). Waiting..."));
+        set_status(&sh, format!("Sharing at {ip}. Last viewer left{note}. Waiting..."));
     }
 }
 
@@ -157,17 +165,29 @@ fn serve(sh: &Sh, conn: &mut TcpStream, password: &str) -> io::Result<()> {
         let _ = reader.shutdown(Shutdown::Both);
     });
 
-    let monitor = xcap::Monitor::all()
-        .map_err(io::Error::other)?
-        .into_iter()
+    let monitors = xcap::Monitor::all().map_err(io::Error::other)?;
+    let monitor = monitors
+        .iter()
         .find(|m| m.is_primary().unwrap_or(false))
-        .ok_or_else(|| io::Error::other("no primary monitor"))?;
+        .or_else(|| monitors.first())
+        .ok_or_else(|| io::Error::other("no monitor found"))?;
     loop {
-        let img = monitor.capture_image().map_err(io::Error::other)?;
+        // A single bad frame (device lost on a resolution/fullscreen switch) must not drop
+        // the session; skip it and retry. Only a send error means the viewer is really gone.
+        let img = match monitor.capture_image() {
+            Ok(img) => img,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+        };
         let mut jpg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 50)
+        if image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 50)
             .encode_image(&image::DynamicImage::ImageRgba8(img).to_rgb8())
-            .map_err(io::Error::other)?;
+            .is_err()
+        {
+            continue;
+        }
         send(conn, &jpg)?;
         thread::sleep(Duration::from_millis(40)); // ponytail: full JPEG each frame, send changed tiles if it lags
     }
@@ -241,19 +261,19 @@ fn view(sh: Sh, ctx: egui::Context, addr: String, password: String) {
         s.set_nodelay(true)?;
         let nonce = recv(&mut s)?;
         send(&mut s, &mac(&password, &nonce).finalize().into_bytes())?;
-        sh.lock().unwrap().conn = Some(s.try_clone()?);
+        lock(&sh).conn = Some(s.try_clone()?);
         loop {
             let jpg = recv(&mut s)?;
             let img = image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg)
                 .map_err(io::Error::other)?
                 .to_rgba8();
             let frame = ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], &img);
-            sh.lock().unwrap().frame = Some(frame);
+            lock(&sh).frame = Some(frame);
             got_frame = true;
             ctx.request_repaint();
         }
     })();
-    let mut s = sh.lock().unwrap();
+    let mut s = lock(&sh);
     s.viewing = false;
     s.conn = None;
     s.frame = None;
@@ -314,12 +334,46 @@ struct App {
     password: String,
     friend: String,
     tex: Option<TextureHandle>,
+    tray: Option<tray_icon::TrayIcon>,
+}
+
+fn show_window(hwnd: isize, show: bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOW, SetForegroundWindow, ShowWindow};
+    let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE });
+        if show {
+            SetForegroundWindow(hwnd);
+        }
+    }
+}
+
+/// Hide the window and park an icon in the tray (Windows puts new icons under "hidden items").
+/// Left-click the icon to bring the window back. Win32 directly: winit stops pumping a hidden eframe window.
+fn hide_to_tray(frame: &eframe::Frame) -> Option<tray_icon::TrayIcon> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+    let RawWindowHandle::Win32(h) = frame.window_handle().ok()?.as_raw() else { return None };
+    let hwnd = h.hwnd.get();
+    TrayIconEvent::set_event_handler(Some(move |e| {
+        if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+            show_window(hwnd, true);
+        }
+    }));
+    let rgba = [0x2a, 0x7f, 0xff, 0xff].repeat(16 * 16); // ponytail: plain blue square, swap for a real icon
+    let tray = tray_icon::TrayIconBuilder::new()
+        .with_icon(tray_icon::Icon::from_rgba(rgba, 16, 16).ok()?)
+        .with_tooltip("LinkDesk (click to show)")
+        .build()
+        .ok()?;
+    show_window(hwnd, false);
+    Some(tray)
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let mut sh = self.sh.lock().unwrap();
+        let mut sh = lock(&self.sh);
 
         if sh.viewing {
             if let Some(frame) = sh.frame.take() {
@@ -356,7 +410,12 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("LinkDesk");
+            ui.horizontal(|ui| {
+                ui.heading("LinkDesk");
+                if ui.small_button("Hide to tray").clicked() {
+                    self.tray = hide_to_tray(frame);
+                }
+            });
             ui.add_space(8.0);
 
             // Step 1: Tailscale
@@ -376,7 +435,7 @@ impl eframe::App for App {
                     let s = self.sh.clone();
                     thread::spawn(move || {
                         if installed { sign_in(&s) } else { install_tailscale(&s) }
-                        s.lock().unwrap().busy = false;
+                        lock(&s).busy = false;
                     });
                 }
                 ui.small("Both of you need Tailscale, on the same network (invite each other at login.tailscale.com).");
@@ -427,7 +486,7 @@ fn main() -> eframe::Result {
         let ip = ts_ip();
         let installed = ip.is_some() || ts_installed();
         {
-            let mut g = s.lock().unwrap();
+            let mut g = lock(&s);
             (g.ip, g.installed, g.checked) = (ip, installed, true);
         }
         if let Some(c) = &*ctx_bg.lock().unwrap() {
@@ -443,7 +502,7 @@ fn main() -> eframe::Result {
         },
         Box::new(move |cc| {
             *ctx_slot.lock().unwrap() = Some(cc.egui_ctx.clone());
-            Ok(Box::new(App { sh, password: String::new(), friend: String::new(), tex: None }))
+            Ok(Box::new(App { sh, password: String::new(), friend: String::new(), tex: None, tray: None }))
         }),
     )
 }
